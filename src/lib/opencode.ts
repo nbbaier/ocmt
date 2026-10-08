@@ -1,277 +1,356 @@
 /**
  * OpenCode AI client for generating commit messages and changelogs
  *
- * Integrates with opencode.ai SDK for AI inference
+ * Talks to the opencode v2 server HTTP API (/api/*, Basic auth)
  */
 
+import { type ChildProcess, exec, spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { promisify } from "node:util";
 import * as p from "@clack/prompts";
 import color from "picocolors";
-import {
-  createOpencode,
-  createOpencodeClient,
-  type OpencodeClient,
-} from "@opencode-ai/sdk";
-import { exec } from "child_process";
-import { promisify } from "util";
-import { getCommitConfig, getChangelogConfig } from "./config";
+import { getChangelogConfig, getCommitConfig } from "./config";
 
 const execAsync = promisify(exec);
 
+// The v2 server checks the password and always expects this username
+const SERVER_USERNAME = "opencode";
+const DEFAULT_SERVER_URL = "http://127.0.0.1:4096";
+const SERVER_START_TIMEOUT = 10000;
+
+interface ModelRef {
+	providerID: string;
+	id: string;
+}
+
 // Models
-const COMMIT_MODEL = {
-  providerID: "opencode",
-  modelID: "gpt-5-nano",
+const COMMIT_MODEL: ModelRef = {
+	providerID: "opencode",
+	id: "gpt-5-nano",
 };
 
-const CHANGELOG_MODEL = {
-  providerID: "opencode",
-  modelID: "claude-sonnet-4-5",
+const CHANGELOG_MODEL: ModelRef = {
+	providerID: "opencode",
+	id: "claude-sonnet-4-5",
 };
+
+interface Connection {
+	baseUrl: string;
+	authorization: string;
+}
 
 // Server state
-let clientInstance: OpencodeClient | null = null;
-let serverInstance: { close: () => void } | null = null;
+let connectionInstance: Connection | null = null;
+let serverProcess: ChildProcess | null = null;
 
 export interface CommitGenerationOptions {
-  diff: string;
-  context?: string;
+	diff: string;
+	context?: string;
 }
 
 export interface ChangelogGenerationOptions {
-  commits: Array<{ hash: string; message: string }>;
-  diff?: string;
-  fromRef: string;
-  toRef: string;
-  version?: string | null;
+	commits: Array<{ hash: string; message: string }>;
+	diff?: string;
+	fromRef: string;
+	toRef: string;
+	version?: string | null;
 }
 
 export interface UpdateChangelogOptions {
-  newChangelog: string;
-  existingChangelog: string;
-  changelogPath: string;
+	newChangelog: string;
+	existingChangelog: string;
+	changelogPath: string;
 }
 
 /**
  * Check if opencode CLI is installed
  */
 async function isOpencodeInstalled(): Promise<boolean> {
-  try {
-    await execAsync("which opencode");
-    return true;
-  } catch {
-    return false;
-  }
+	try {
+		await execAsync("which opencode");
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function createConnection(baseUrl: string, password: string): Connection {
+	const credentials = Buffer.from(`${SERVER_USERNAME}:${password}`).toString(
+		"base64",
+	);
+	return {
+		baseUrl: baseUrl.replace(/\/$/, ""),
+		authorization: `Basic ${credentials}`,
+	};
 }
 
 /**
- * Check if user is authenticated with opencode
+ * Send a JSON request to the OpenCode server
  */
-async function checkAuth(client: OpencodeClient): Promise<boolean> {
-  try {
-    const config = await client.config.get();
-    return !!config;
-  } catch {
-    return false;
-  }
+async function request<T>(
+	connection: Connection,
+	method: string,
+	path: string,
+	body?: unknown,
+): Promise<T> {
+	const response = await fetch(`${connection.baseUrl}${path}`, {
+		method,
+		headers: {
+			authorization: connection.authorization,
+			...(body === undefined ? {} : { "content-type": "application/json" }),
+		},
+		body: body === undefined ? undefined : JSON.stringify(body),
+	});
+
+	if (!response.ok) {
+		const text = await response.text();
+		let message = text;
+		try {
+			message = JSON.parse(text).message ?? text;
+		} catch {
+			// Not JSON, use the raw body
+		}
+		throw new Error(
+			`OpenCode ${method} ${path} failed (${response.status}): ${message}`,
+		);
+	}
+
+	if (response.status === 204) {
+		return undefined as T;
+	}
+
+	// v1 servers and the web UI answer unknown routes with HTML
+	if (!response.headers.get("content-type")?.includes("application/json")) {
+		throw new Error(
+			`OpenCode ${method} ${path} returned non-JSON; is the server opencode v2?`,
+		);
+	}
+
+	return (await response.json()) as T;
 }
 
 /**
- * Get or create the OpenCode client
+ * Connect to an already running server, if we have its password
+ */
+async function connectExisting(): Promise<Connection | null> {
+	const password =
+		process.env.OPENCODE_PASSWORD ?? process.env.OPENCODE_SERVER_PASSWORD;
+	if (!password) {
+		return null;
+	}
+
+	const connection = createConnection(
+		process.env.OPENCODE_SERVER_URL ?? DEFAULT_SERVER_URL,
+		password,
+	);
+	try {
+		await request(connection, "GET", "/api/provider");
+		return connection;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Spawn `opencode serve` with a generated password and wait until it listens
+ */
+function spawnServer(): Promise<Connection> {
+	const password = randomBytes(32).toString("base64url");
+	// OPENCODE_PASSWORD takes precedence over OPENCODE_SERVER_PASSWORD
+	const { OPENCODE_PASSWORD: _, ...env } = process.env;
+
+	const proc = spawn("opencode", ["serve", "--hostname=127.0.0.1"], {
+		env: { ...env, OPENCODE_SERVER_PASSWORD: password },
+	});
+	serverProcess = proc;
+
+	return new Promise((resolve, reject) => {
+		let output = "";
+
+		const fail = (error: Error) => {
+			clearTimeout(timer);
+			proc.kill();
+			reject(error);
+		};
+
+		const timer = setTimeout(
+			() =>
+				fail(
+					new Error(
+						`Timeout waiting for server to start after ${SERVER_START_TIMEOUT}ms`,
+					),
+				),
+			SERVER_START_TIMEOUT,
+		);
+
+		proc.stdout?.on("data", (chunk) => {
+			output += chunk.toString();
+			const match = output.match(/server listening on (https?:\/\/\S+)/);
+			if (match) {
+				clearTimeout(timer);
+				resolve(createConnection(match[1], password));
+			}
+		});
+		proc.stderr?.on("data", (chunk) => {
+			output += chunk.toString();
+		});
+		proc.on("error", fail);
+		proc.on("exit", (code) => {
+			clearTimeout(timer);
+			reject(
+				new Error(
+					`Server exited with code ${code}${output.trim() ? `\nServer output: ${output}` : ""}`,
+				),
+			);
+		});
+	});
+}
+
+/**
+ * Get or create the OpenCode server connection
  * Tries to connect to existing server first, spawns new one if needed
  */
-async function getClient(): Promise<OpencodeClient> {
-  if (clientInstance) {
-    return clientInstance;
-  }
+async function getConnection(): Promise<Connection> {
+	if (connectionInstance) {
+		return connectionInstance;
+	}
 
-  // Try connecting to existing server first
-  try {
-    const client = createOpencodeClient({
-      baseUrl: "http://localhost:4096",
-    });
-    // Test connection
-    await client.config.get();
-    clientInstance = client;
-    return client;
-  } catch {
-    // No existing server, need to spawn one
-  }
+	// Try connecting to existing server first
+	const existing = await connectExisting();
+	if (existing) {
+		connectionInstance = existing;
+		return existing;
+	}
 
-  // Check if opencode is installed
-  if (!(await isOpencodeInstalled())) {
-    p.log.error("OpenCode CLI is not installed");
-    p.log.info(
-      `Install it with: ${color.cyan("npm install -g opencode")} or ${color.cyan("brew install sst/tap/opencode")}`
-    );
-    process.exit(1);
-  }
+	// Check if opencode is installed
+	if (!(await isOpencodeInstalled())) {
+		p.log.error("OpenCode CLI is not installed");
+		p.log.info(
+			`Install it with: ${color.cyan("npm install -g opencode")} or ${color.cyan("brew install sst/tap/opencode")}`,
+		);
+		process.exit(1);
+	}
 
-  // Spawn new server
-  try {
-    const opencode = await createOpencode({
-      timeout: 10000,
-    });
+	// Spawn new server
+	try {
+		connectionInstance = await spawnServer();
 
-    clientInstance = opencode.client;
-    serverInstance = opencode.server;
+		// Clean up server on process exit
+		process.on("exit", () => {
+			serverProcess?.kill();
+		});
+		process.on("SIGINT", () => {
+			serverProcess?.kill();
+			process.exit(0);
+		});
+		process.on("SIGTERM", () => {
+			serverProcess?.kill();
+			process.exit(0);
+		});
 
-    // Check authentication
-    if (!(await checkAuth(opencode.client))) {
-      p.log.warn("Not authenticated with OpenCode");
-      p.log.info(`Run ${color.cyan("opencode auth")} to authenticate`);
-      process.exit(1);
-    }
-
-    // Clean up server on process exit
-    process.on("exit", () => {
-      serverInstance?.close();
-    });
-    process.on("SIGINT", () => {
-      serverInstance?.close();
-      process.exit(0);
-    });
-    process.on("SIGTERM", () => {
-      serverInstance?.close();
-      process.exit(0);
-    });
-
-    return opencode.client;
-  } catch (error: any) {
-    p.log.error(`Failed to start OpenCode server: ${error.message}`);
-    p.log.info(`Make sure OpenCode is installed and configured correctly`);
-    process.exit(1);
-  }
+		return connectionInstance;
+	} catch (error: any) {
+		p.log.error(`Failed to start OpenCode server: ${error.message}`);
+		p.log.info(`Make sure OpenCode is installed and configured correctly`);
+		process.exit(1);
+	}
 }
 
 /**
- * Extract text content from AI response parts
+ * Run a one-off prompt in a temporary session and return the generated text
  */
-function extractTextFromParts(parts: any[]): string {
-  const textParts = parts
-    .filter((part) => part.type === "text")
-    .map((part) => part.text)
-    .join("");
+async function generate(
+	title: string,
+	model: ModelRef,
+	prompt: string,
+): Promise<string> {
+	const connection = await getConnection();
 
-  return textParts.trim();
+	const session = await request<{ data: { id: string } }>(
+		connection,
+		"POST",
+		"/api/session",
+		{ title, model, location: { directory: process.cwd() } },
+	);
+	const sessionPath = `/api/session/${encodeURIComponent(session.data.id)}`;
+
+	try {
+		const result = await request<{ data: { text: string } }>(
+			connection,
+			"POST",
+			`${sessionPath}/generate`,
+			{ prompt },
+		);
+		return result.data.text.trim();
+	} finally {
+		// Clean up session
+		await request(connection, "DELETE", sessionPath).catch(() => {});
+	}
 }
 
 /**
  * Generate a commit message from a git diff using OpenCode AI
  */
 export async function generateCommitMessage(
-  options: CommitGenerationOptions
+	options: CommitGenerationOptions,
 ): Promise<string> {
-  const { diff, context } = options;
+	const { diff, context } = options;
 
-  const client = await getClient();
-  const systemPrompt = await getCommitConfig();
+	const systemPrompt = await getCommitConfig();
 
-  // Create a session for this commit
-  const session = await client.session.create({
-    body: { title: "oc-commit" },
-  });
+	// Build the prompt
+	let prompt = `${systemPrompt}\n\n---\n\nGenerate a commit message for the following diff:\n\n\`\`\`diff\n${diff}\n\`\`\``;
 
-  if (!session.data) {
-    throw new Error("Failed to create session");
-  }
+	if (context) {
+		prompt += `\n\nAdditional context: ${context}`;
+	}
 
-  // Build the prompt
-  let prompt = `${systemPrompt}\n\n---\n\nGenerate a commit message for the following diff:\n\n\`\`\`diff\n${diff}\n\`\`\``;
+	const message = await generate("oc-commit", COMMIT_MODEL, prompt);
 
-  if (context) {
-    prompt += `\n\nAdditional context: ${context}`;
-  }
+	if (!message) {
+		throw new Error("No commit message generated");
+	}
 
-  // Send the prompt
-  const result = await client.session.prompt({
-    path: { id: session.data.id },
-    body: {
-      model: COMMIT_MODEL,
-      parts: [{ type: "text", text: prompt }],
-    },
-  });
-
-  if (!result.data) {
-    throw new Error("Failed to get AI response");
-  }
-
-  // Extract the commit message from the response
-  const message = extractTextFromParts(result.data.parts || []);
-
-  // Clean up session
-  await client.session.delete({ path: { id: session.data.id } });
-
-  if (!message) {
-    throw new Error("No commit message generated");
-  }
-
-  // Clean up the message (remove markdown code blocks if present)
-  return message
-    .replace(/^```[\s\S]*?\n/, "")
-    .replace(/\n```$/, "")
-    .trim();
+	// Clean up the message (remove markdown code blocks if present)
+	return message
+		.replace(/^```[\s\S]*?\n/, "")
+		.replace(/\n```$/, "")
+		.trim();
 }
 
 /**
  * Generate a changelog from commits using OpenCode AI
  */
 export async function generateChangelog(
-  options: ChangelogGenerationOptions
+	options: ChangelogGenerationOptions,
 ): Promise<string> {
-  const { commits, fromRef, toRef, version } = options;
+	const { commits, fromRef, toRef, version } = options;
 
-  const client = await getClient();
-  const systemPrompt = await getChangelogConfig();
+	const systemPrompt = await getChangelogConfig();
 
-  // Create a session for this changelog
-  const session = await client.session.create({
-    body: { title: "oc-changelog" },
-  });
+	// Build the commits list
+	const commitsList = commits
+		.map((c) => `- ${c.hash}: ${c.message}`)
+		.join("\n");
 
-  if (!session.data) {
-    throw new Error("Failed to create session");
-  }
+	// Build version instruction
+	let versionInstruction = "";
+	if (version) {
+		versionInstruction = `\n\nIMPORTANT: A version bump to ${version} was detected. Use "[${version}]" as the version header with today's date (format: YYYY-MM-DD), NOT "[Unreleased]".`;
+	} else {
+		versionInstruction = `\n\nUse "[Unreleased]" as the version header since no version bump was detected.`;
+	}
 
-  // Build the commits list
-  const commitsList = commits
-    .map((c) => `- ${c.hash}: ${c.message}`)
-    .join("\n");
+	// Build the prompt
+	const prompt = `${systemPrompt}\n\n---\n\nGenerate a changelog for the following commits (from ${fromRef} to ${toRef}):${versionInstruction}\n\n${commitsList}`;
 
-  // Build version instruction
-  let versionInstruction = "";
-  if (version) {
-    versionInstruction = `\n\nIMPORTANT: A version bump to ${version} was detected. Use "[${version}]" as the version header with today's date (format: YYYY-MM-DD), NOT "[Unreleased]".`;
-  } else {
-    versionInstruction = `\n\nUse "[Unreleased]" as the version header since no version bump was detected.`;
-  }
+	const changelog = await generate("oc-changelog", CHANGELOG_MODEL, prompt);
 
-  // Build the prompt
-  const prompt = `${systemPrompt}\n\n---\n\nGenerate a changelog for the following commits (from ${fromRef} to ${toRef}):${versionInstruction}\n\n${commitsList}`;
+	if (!changelog) {
+		throw new Error("No changelog generated");
+	}
 
-  // Send the prompt
-  const result = await client.session.prompt({
-    path: { id: session.data.id },
-    body: {
-      model: CHANGELOG_MODEL,
-      parts: [{ type: "text", text: prompt }],
-    },
-  });
-
-  if (!result.data) {
-    throw new Error("Failed to get AI response");
-  }
-
-  // Extract the changelog from the response
-  const changelog = extractTextFromParts(result.data.parts || []);
-
-  // Clean up session
-  await client.session.delete({ path: { id: session.data.id } });
-
-  if (!changelog) {
-    throw new Error("No changelog generated");
-  }
-
-  return changelog.trim();
+	return changelog;
 }
 
 /**
@@ -279,22 +358,11 @@ export async function generateChangelog(
  * The AI will merge the new changelog content with existing content properly
  */
 export async function updateChangelogFile(
-  options: UpdateChangelogOptions
+	options: UpdateChangelogOptions,
 ): Promise<string> {
-  const { newChangelog, existingChangelog, changelogPath } = options;
+	const { newChangelog, existingChangelog } = options;
 
-  const client = await getClient();
-
-  // Create a session for this update
-  const session = await client.session.create({
-    body: { title: "oc-changelog-update" },
-  });
-
-  if (!session.data) {
-    throw new Error("Failed to create session");
-  }
-
-  const prompt = `You are updating a CHANGELOG.md file. Your task is to intelligently merge new changelog entries into the existing file.
+	const prompt = `You are updating a CHANGELOG.md file. Your task is to intelligently merge new changelog entries into the existing file.
 
 ## Rules:
 1. Preserve the existing file structure and header
@@ -317,44 +385,31 @@ ${newChangelog}
 
 Return the complete updated CHANGELOG.md content:`;
 
-  // Send the prompt
-  const result = await client.session.prompt({
-    path: { id: session.data.id },
-    body: {
-      model: CHANGELOG_MODEL,
-      parts: [{ type: "text", text: prompt }],
-    },
-  });
+	let updatedChangelog = await generate(
+		"oc-changelog-update",
+		CHANGELOG_MODEL,
+		prompt,
+	);
 
-  if (!result.data) {
-    throw new Error("Failed to get AI response");
-  }
+	if (!updatedChangelog) {
+		throw new Error("No updated changelog generated");
+	}
 
-  // Extract the updated changelog
-  let updatedChangelog = extractTextFromParts(result.data.parts || []);
+	// Clean up markdown code blocks if present
+	updatedChangelog = updatedChangelog
+		.replace(/^```markdown\n?/i, "")
+		.replace(/^```\n?/, "")
+		.replace(/\n?```$/, "")
+		.trim();
 
-  // Clean up session
-  await client.session.delete({ path: { id: session.data.id } });
-
-  if (!updatedChangelog) {
-    throw new Error("No updated changelog generated");
-  }
-
-  // Clean up markdown code blocks if present
-  updatedChangelog = updatedChangelog
-    .replace(/^```markdown\n?/i, "")
-    .replace(/^```\n?/, "")
-    .replace(/\n?```$/, "")
-    .trim();
-
-  return updatedChangelog;
+	return updatedChangelog;
 }
 
 /**
  * Cleanup function to close the server if we spawned one
  */
 export function cleanup(): void {
-  serverInstance?.close();
-  serverInstance = null;
-  clientInstance = null;
+	serverProcess?.kill();
+	serverProcess = null;
+	connectionInstance = null;
 }
