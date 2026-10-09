@@ -249,8 +249,12 @@ async function getConnection(): Promise<Connection> {
 		});
 
 		return connectionInstance;
-	} catch (error: any) {
-		p.log.error(`Failed to start OpenCode server: ${error.message}`);
+	} catch (error: unknown) {
+		if (error instanceof Error) {
+			p.log.error(`Failed to start OpenCode server: ${error.message}`);
+		} else {
+			p.log.error(`Failed to start OpenCode server: ${String(error)}`);
+		}
 		p.log.info(`Make sure OpenCode is installed and configured correctly`);
 		process.exit(1);
 	}
